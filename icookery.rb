@@ -1,39 +1,115 @@
+#!/usr/bin/ruby
+# coding: utf-8
+
 require 'json'
-require 'ffi-rzmq'
+require 'rbczmq'
 require 'openssl'
 require 'uuidtools'
+require 'colored'
+require 'awesome_print'
 
 class ICookery
-  def self.message_header
+  @DELIMETER = '<IDS|MSG>'
+  @l = Logger.new(STDOUT)
+
+  class<< self
+    attr_accessor :instance, :l, :DELIMETER
+  end
+
+  def initialize(connection_file)
+    @session = UUIDTools::UUID.random_create.to_s
+    config = JSON.load(File.read connection_file)
+    @key = config['key']
+    @execution_counter = 0
+
+    ICookery.instance = self
+    context = ZMQ::Context.new
+
+    address = "#{config["transport"]}://#{config["ip"]}:%d"
+
+    @iopub_socket       = context.socket(:PUB)
+    @iopub_socket.connect(address % config['iopub_port'])
+    @sockets = {:iopub_socket => @iopub_socket}
+    send_status(:starting)
+
+    # @control_socket_rcv = context.socket(:ROUTER)
+    # @control_socket     = context.socket(:ROUTER)
+    @shell_socket       = context.socket(:ROUTER)
+    # @stdin_socket_rcv   = context.socket(:ROUTER)
+    # @stdin_socket       = context.socket(:ROUTER)
+
+    @sockets[:shell_socket] = @shell_socket
+
+    # control_socket_rcv.bind(address + @@control_port.to_s)
+    # control_socket.connect(address + @@control_port.to_s)
+    @shell_socket.bind(address % config['shell_port'])
+    # @stdin_socket.bind(address % config['stdin_port'])
+
+    hb_thread = Thread.new do
+      hb_socket = context.socket(:REP)
+      hb_socket.bind(address % config['hb_port'])
+      ZMQ.proxy(hb_socket, hb_socket)
+    end
+
+    @identities = []
+    run_kernel
+  end
+
+  def message_header
     {'msg_id' => UUIDTools::UUID.random_create.to_s,
      'username' => ENV['USERNAME'],
-     'session' => "session1",
+     'session' => @session,
      'version' => '5.0'}
   end
 
-  def self.send_message(socket, uuid, type, content)
-    result = [uuid , #uuid
-              '<IDS|MSG>', #delimiter
-              '', #hmac
-              JSON.dump({'msg_type' => type}.merge(message_header)), #header
-              '{}', #parent_header
-              '{}', #metadata
-              JSON.dump(content), #content
-              nil, #blob
-             ]
-    result[2] = digest(result)
-    puts "SENDING MESSAGE"
-    result.each do |i|
-      puts i == '' ? ':empty:' : i
+  def recv_message(socket)
+    message = socket.recv_message
+    @sockets[:iopub_socket].send_message(message.clone)
+
+    if message.nil?
+      ICookery.l.warn "Message is nil on shell socket"
     end
-    r = socket.send_strings(result)
-    puts "Message sent, result: #{r.inspect}"
-    p ZMQ::Util.errno
+
+    messages = message.to_a.map(&:data)
+
+    ICookery.l.debug "Reaciving message:".magenta
+    ICookery.l.ap messages, :debug
+
+    uuid, delimeter, hmac, header, p_header, metadata, \
+    content, blob, *rest = messages
+
+    ICookery.l.warn "no uuid in the message" if uuid.nil?
+
+    # ICookery.l.debug "uuid: "      + uuid.inspect
+    # ICookery.l.debug "delimeter: " + delimeter.inspect
+    # ICookery.l.debug "hmac: "      + hmac.inspect
+    # ICookery.l.debug "header: "    + header.inspect
+    # ICookery.l.debug "p_header: "  + p_header.inspect
+    # ICookery.l.debug "metadata: "  + metadata.inspect
+    ICookery.l.debug "content: "   + content.inspect
+    # ICookery.l.debug "blob: "      + blob.inspect
+    # ICookery.l.debug "rest: "      + rest.inspect
+
+    @last_header = header
+
+    if digest?(messages)
+      ICookery.l.debug "HMAC OK!"
+    else
+      ICookery.l.error "HMAC NOT OK!"
+    end
+
+    @identities = messages.take_while { |i| i != ICookery.DELIMETER}
+    ICookery.l.debug "Setting identities to: #{@identities.map(&:inspect).join(',')}".blue
+    messages
   end
 
-  def self.digest(message)
-    digest = OpenSSL::Digest.new('sha256', @@key)
-    signature= OpenSSL::HMAC.new(@@key, digest)
+  def identities
+    (@identities.nil? or @identities.empty?) ? nil : @identities.join(',')
+  end
+
+  def digest(message)
+    digest = OpenSSL::Digest.new('sha256', @key)
+    signature= OpenSSL::HMAC.new(@key, digest)
     signature << message[3]
     signature << (message[4] || "")
     signature << (message[5] || "")
@@ -41,15 +117,48 @@ class ICookery
     signature.hexdigest
   end
 
-  def self.kernel_info_reply(socket, uuid = '')
-    send_message(socket, uuid, 'kernel_info_reply',
-                 {'protocol_version' => '1.0',
-                  'implementation' => 'cookery',
+  def digest!(message)
+    message[2] = digest(message)
+  end
+
+  def digest?(message)
+    message[2] == digest(message)
+  end
+
+  def send_message(socket, type, content, identity = nil)
+    ICookery.l.debug "Sending message ".red +
+                     type.underline.red + " on socket ".red +
+                     socket.to_s.underline.red
+
+    result = [identity || identities || type, #uuid
+              ICookery.DELIMETER, #delimiter
+              '', #hmac
+              {'msg_type' => type}.merge(message_header), #header
+              @last_header || '{}', #parent_header
+              '{}', #metadata
+              content, #content
+              nil, #blob
+             ]
+    ICookery.l.ap result, :debug
+    result[3] = JSON.dump(result[3])
+    result[6] = JSON.dump(result[6])
+
+    digest!(result)
+
+    result.compact!
+    result[0...-1].each { |r| @sockets[socket].sendm(r) }
+    @sockets[socket].send(result[-1])
+  end
+
+  def kernel_info_reply(socket)
+    send_message(socket, 'kernel_info_reply',
+                 {'protocol_version' => '5.0',
+                  'implementation' => 'icookery',
                   'implementation_version' => '1.0',
                   'language_info' => {
-                    'name' => 'Ruby',
-                    'version' => '2.0',
-                    'mimetype' => 'text',
+                    'name' => 'Cookery',
+                    'version' => '1.0',
+                    'mimetype' => 'text/plain',
                     'file_extension' => 'cookery',
                     # 'pygments_lexer' => str,
                     # 'codemirror_mode' => str or dict,
@@ -59,125 +168,80 @@ class ICookery
 
                   # Optional: A list of dictionaries, each with keys 'text' and 'url'.
                   # These will be displayed in the help menu in the notebook UI.
-                  # 'help_links' => [{'text' => str, 'url' => str}],
+                  'help_links' => [{'text' => "Cookery", 'url' => "http://github.com/mikolajb/cookery"}],
 
                  })
   end
 
-  def self.connect_reply(socket, uuid = '')
-    send_message(socket, uuid, 'connect_reply',
+  def connect_reply(socket)
+    send_message(socket, 'connect_reply',
                  {'shell_port' => @@shell_port,
                   'iopub_port' => @@iopub_port,
                   'stdin_port' => @@stdin_port,
                   'hb_port' => @@hb_port})
   end
 
-  def self.run_kernel(connection_file)
-    config = JSON.load(File.read connection_file)
-    context = ZMQ::Context.create
+  def send_status(status)
+    send_message(:iopub_socket, 'status',
+                 {'execution_state': status},
+                 'status')
+  end
 
-    control_socket = context.socket(ZMQ::ROUTER)
-    shell_socket   = context.socket(ZMQ::ROUTER)
-    stdin_socket   = context.socket(ZMQ::ROUTER)
-    hb_socket      = context.socket(ZMQ::REP)
-    iopub_socket   = context.socket(ZMQ::PUB)
-
-    @@control_port = config["control_port"]
-    @@shell_port = config["shell_port"]
-    @@stdin_port = config["stdin_port"]
-    @@hb_port = config["hb_port"]
-    @@iopub_port = config["iopub_port"]
-    @@key = config["key"]
-    puts "KEY is:"
-    p @@key
-
-    address = "#{config["transport"]}://#{config["ip"]}:"
-    control_socket.bind(address + @@control_port.to_s)
-    shell_socket.bind(address + @@shell_port.to_s)
-    stdin_socket.bind(address + @@stdin_port.to_s)
-    hb_socket.bind(address + @@hb_port.to_s)
-    iopub_socket.bind(address + @@iopub_port.to_s)
-
-    hb_thread = Thread.new(hb_socket) do |s|
-      puts "Starting HB"
-      message = ZMQ::Message.new
-      while true do
-        s.recvmsg(message)
-        puts "got HB #{message.inspect}"
-        s.sendmsg(message)
-      end
-    end
-
+  def run_kernel
     while true
-      messages = []
+      send_status(:idle)
 
-      while true
-        status = control_socket.recv_strings(messages, ZMQ::DONTWAIT)
-        break if messages.empty?
-        puts "reaciving control"
-        p messages
+      ICookery.l.debug "waining for a shell message"
 
-        messages.each do |m|
-          p m
-        end
-        break
+      messages = recv_message(@shell_socket)
+
+      send_status(:busy)
+
+      uuid, delimeter, hmac, header, p_header, metadata, \
+      content, blob, *rest = messages
+
+      break if uuid.nil?
+
+      m = JSON.load(header)
+      if m['msg_type'] == 'kernel_info_request'
+        ICookery.l.debug "Sending kernel info reply"
+        kernel_info_reply(:shell_socket)
+        kernel_info_reply(:iopub_socket)
+      elsif m['msg_type'] == 'connect_request'
+        ICookery.l.debug "Sending connection reply"
+        connect_strings(:shell_socket)
+        connect_strings(:iopub_socket)
+      elsif m['msg_type'] == 'execute_request'
+        @execution_counter += 1
+        ICookery.l.debug "Execution request:"
+        content = JSON.load content
+        ICookery.l.ap content, :debug
+        # send_message(:iopub_socket, 'stream',
+        #              {'name' => 'stdout',
+        #               'text' => 'it works!'})
+        send_message(:iopub_socket, 'execute_input',
+                     {'code' => content['code'],
+                      'execution_count' => @execution_counter})
+
+        send_message(:shell_socket, 'execute_reply',
+                     {'status' => 'ok',
+                      'execution_count' => @execution_counter})
+
+        send_message(:iopub_socket, 'execute_result',
+                     {'execution_count' => @execution_counter,
+                      'data' => {'text/plain' => 'to dziala do cholery!'},
+                      'metadata' => {}
+                     })
       end
-
-      while true
-        status = shell_socket.recv_strings(messages, ZMQ::DONTWAIT)
-        break if messages.empty?
-        puts "reaciving shell"
-        p messages
-
-        uuid, delimeter, hmac, header, p_header, metadata, \
-        content, blob, *rest = messages
-
-        break if uuid.nil?
-
-        puts "uuid: " + uuid.inspect
-        puts "delimeter: " + delimeter.inspect
-        puts "hmac: " + hmac.inspect
-        puts "header: " + header.inspect
-        puts "p_header: " + p_header.inspect
-        puts "metadata: " + metadata.inspect
-        puts "content: " + content.inspect
-        puts "blob: " + blob.inspect
-        puts "rest: " + rest.inspect
-
-        if digest(messages) == hmac
-          puts "HMAC OK!"
-        else
-          warn "HMAC NOT OK!"
-          break
-        end
-
-        m = JSON.load(header)
-        if m['msg_type'] == 'kernel_info_request'
-          kernel_info_reply(shell_socket, uuid)
-        elsif m['msg_type'] == 'connect_request'
-          send_strings(shell_socket, uuid)
-        elsif m['msg_type'] == 'execute_request'
-
-        end
-
-        break
-      end
-      # puts "reaciving stdin"
-      # p stdin_socket.recvmsg(message)
-      # p message
-      # puts "reaciving iopub"
-      # p iopub_socket.recvmsg(message)
-      # p message
-      sleep 1
     end
 
     config["signature_scheme"]
   end
 end
 
-p ARGV
 if ARGV.empty?
-  warn "no arguments"
+  ICookery.l.warn "No command line arguments"
 else
-  ICookery.run_kernel(ARGV[0])
+  ICookery.l.debug "Command line arguments: #{ARGV.inspect}"
+  ICookery.new(ARGV[0])
 end
